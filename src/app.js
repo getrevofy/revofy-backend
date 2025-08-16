@@ -1,24 +1,25 @@
 // src/app.js
 // ================================
 // Revofy minimal backend (Render)
-// - GET  /health                       -> { ok: true }
-// - GET  /                              -> text
-// - POST /webhook/lemonsqueezy         -> LS webhook (HMAC doğrulama, RAW body)
-// - ALL  /admin/init?key=...           -> DB şemasını kurar (INIT_SECRET ile)
-// - POST /auth/signup                  -> kayıt
-// - POST /auth/login                   -> giriş
-// - GET  /me (Authorization: Bearer)   -> kullanıcı & abonelik durumu
+// - GET  /health
+// - GET  /
+// - POST /webhook/lemonsqueezy     (RAW body + HMAC doğrulama)
+// - ALL  /admin/init?key=...       (DB şemasını kurar; INIT_SECRET)
+// - POST /auth/signup
+// - POST /auth/login
+// - GET  /me                       (JWT ile)
+// - GET  /billing/checkout         (Lemon hosted checkout linki)
 // ================================
 
 const express = require("express");
 const crypto  = require("crypto");
 const db      = require("./db");
-const auth    = require("./auth"); // <— auth route'ları buradan gelecek
+const auth    = require("./auth");
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-/** WEBHOOK: RAW body gerekir. JSON parser'dan ÖNCE tanımla. */
+/** WEBHOOK — RAW body gerekli; JSON parser’dan ÖNCE tanımla */
 app.post(
   "/webhook/lemonsqueezy",
   express.raw({ type: "application/json" }),
@@ -26,16 +27,12 @@ app.post(
     try {
       const signature = req.get("X-Signature") || "";
       const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
-      if (!secret) {
-        console.error("Missing LEMON_SQUEEZY_WEBHOOK_SECRET");
-        return res.status(500).send("Missing secret");
-      }
+      if (!secret) return res.status(500).send("Missing secret");
 
       const digest = crypto.createHmac("sha256", secret).update(req.body).digest("hex");
       const a = Buffer.from(digest, "utf8");
       const b = Buffer.from(signature, "utf8");
       if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-        console.warn("Invalid webhook signature");
         return res.status(400).send("Invalid signature");
       }
 
@@ -43,7 +40,57 @@ app.post(
       const name  = event?.meta?.event_name || "unknown";
       console.log("✅ LS webhook:", name);
 
-      // TODO: event'e göre DB güncelle (subscription_created/updated/expired/payment_success)
+      // === SUBSCRIPTION DB GÜNCELLE ===
+      (async () => {
+        const data = event?.data?.attributes || {};
+        // Email birden fazla isimle gelebilir, olası alanları dene:
+        const email =
+          data.user_email ||
+          data.customer_email ||
+          data.email ||
+          event?.data?.relationships?.customer?.data?.email ||
+          null;
+
+        if (!email) {
+          console.warn("Webhook: email bulunamadı, DB güncellenmedi");
+          return;
+        }
+
+        // Kullanıcıyı bul/oluştur
+        const { rows: userRows } = await db.query(
+          `INSERT INTO users (email)
+             VALUES ($1)
+             ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+             RETURNING id, email`,
+          [email]
+        );
+        const userId = userRows[0].id;
+
+        // Event adına göre status belirle
+        let status = "none";
+        if (/subscription_created|subscription_updated|payment_success|order_created/i.test(name)) {
+          status = "active";
+        }
+        if (/subscription_expired|subscription_cancelled|subscription_canceled|subscription_paused/i.test(name)) {
+          status = "expired";
+        }
+
+        // Dönem sonu
+        const periodEnd = data.renews_at || data.ends_at || data.trial_ends_at || null;
+
+        await db.query(
+          `INSERT INTO subscriptions (user_id, status, current_period_end, updated_at)
+             VALUES ($1, $2, $3, now())
+             ON CONFLICT (user_id)
+             DO UPDATE SET status = EXCLUDED.status,
+                           current_period_end = EXCLUDED.current_period_end,
+                           updated_at = now()`,
+          [userId, status, periodEnd]
+        );
+
+        console.log(`🔄 Subscription -> ${email}: ${status} (until ${periodEnd || "-"})`);
+      })().catch(err => console.error("Webhook DB update failed:", err));
+
       return res.status(200).send("OK");
     } catch (err) {
       console.error("Webhook error", err);
@@ -52,13 +99,23 @@ app.post(
   }
 );
 
-/** JSON parser — webhook'tan SONRA gelmeli */
+/** JSON parser — webhook’tan SONRA gelmeli */
 app.use(express.json({ limit: "1mb" }));
 
 /** AUTH ROUTES */
 app.post("/auth/signup", auth.signup);
 app.post("/auth/login",  auth.login);
 app.get ("/me",          auth.authMiddleware, auth.me);
+
+/** BILLING — hosted checkout linki döndür */
+app.get("/billing/checkout", auth.authMiddleware, (req, res) => {
+  const url = process.env.LEMON_SQUEEZY_CHECKOUT_URL;
+  if (!url) return res.status(500).json({ error: "no_checkout_url" });
+  // (opsiyonel) e-posta otomatik dolsun
+  const u = new URL(url);
+  u.searchParams.set("checkout[email]", req.user.email);
+  res.json({ url: u.toString() });
+});
 
 /** Health & Root */
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -73,10 +130,8 @@ app.all("/admin/init", async (req, res) => {
     }
 
     const sql = `
-      -- UUID üretimi için eklenti
       CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-      -- Kullanıcılar
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         email TEXT UNIQUE NOT NULL,
@@ -84,15 +139,13 @@ app.all("/admin/init", async (req, res) => {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
 
-      -- Abonelik durumu
       CREATE TABLE IF NOT EXISTS subscriptions (
         user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-        status TEXT NOT NULL DEFAULT 'none', -- none | active | on_trial | past_due | canceled | expired
+        status TEXT NOT NULL DEFAULT 'none',
         current_period_end TIMESTAMPTZ,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
 
-      -- Kota sayaçları
       CREATE TABLE IF NOT EXISTS usage_counters (
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
         day DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -102,7 +155,6 @@ app.all("/admin/init", async (req, res) => {
         PRIMARY KEY (user_id, day)
       );
     `;
-
     await db.query(sql);
     return res.json({ ok: true, message: "schema installed" });
   } catch (e) {
