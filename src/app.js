@@ -11,25 +11,48 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 app.get("/", (req, res) => res.send("🚀 Revofy backend is running!"));
 
 // --- Kurulum endpoint'i ---
-// Amaç: Tabloları tek seferde oluşturmak. Güvenlik için INIT_SECRET ile korunuyor.
-app.post("/admin/init", async (req, res) => {
+// Hem GET hem POST kabul etsin ki tarayıcıdan çağırabilelim.
+app.all("/admin/init", async (req, res) => {
   try {
-    const key = req.query.key || req.headers["x-init-key"];
+    const key = (req.query.key || req.headers["x-init-key"]);
     if (!process.env.INIT_SECRET || key !== process.env.INIT_SECRET) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
     const sql = `
-      -- Gerekli extension (UUID üretimi)
       CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-      -- Kullanıcılar
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         email TEXT UNIQUE NOT NULL,
         password_hash TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
+
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'none',
+        current_period_end TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS usage_counters (
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        day DATE NOT NULL DEFAULT CURRENT_DATE,
+        month TEXT NOT NULL DEFAULT TO_CHAR(now(), 'YYYY-MM'),
+        daily_count INT NOT NULL DEFAULT 0,
+        monthly_count INT NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, day)
+      );
+    `;
+    await db.query(sql);
+    return res.json({ ok: true, message: "schema installed" });
+  } catch (e) {
+    console.error("INIT ERROR", e);
+    return res.status(500).json({ ok: false, error: "init_failed" });
+  }
+});
+
 
       -- Abonelik durumu
       CREATE TABLE IF NOT EXISTS subscriptions (
