@@ -1,23 +1,24 @@
 // src/app.js
 // ================================
 // Revofy minimal backend (Render)
-// - GET /health  -> { ok: true }
-// - GET /        -> text
-// - POST /webhook/lemonsqueezy -> LS webhook (HMAC doğrulama)
-// - GET/POST /admin/init?key=... -> DB şemasını kurar (INIT_SECRET ile korunur)
+// - GET  /health                       -> { ok: true }
+// - GET  /                              -> text
+// - POST /webhook/lemonsqueezy         -> LS webhook (HMAC doğrulama, RAW body)
+// - ALL  /admin/init?key=...           -> DB şemasını kurar (INIT_SECRET ile)
+// - POST /auth/signup                  -> kayıt
+// - POST /auth/login                   -> giriş
+// - GET  /me (Authorization: Bearer)   -> kullanıcı & abonelik durumu
 // ================================
 
 const express = require("express");
 const crypto  = require("crypto");
 const db      = require("./db");
+const auth    = require("./auth"); // <— auth route'ları buradan gelecek
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-/**
- * DİKKAT: Webhook için RAW body gerekir.
- * Bu yüzden webhook route'unu, json parser'dan ÖNCE tanımlıyoruz.
- */
+/** WEBHOOK: RAW body gerekir. JSON parser'dan ÖNCE tanımla. */
 app.post(
   "/webhook/lemonsqueezy",
   express.raw({ type: "application/json" }),
@@ -30,7 +31,6 @@ app.post(
         return res.status(500).send("Missing secret");
       }
 
-      // HMAC-SHA256 ile imza doğrula (raw body üzerinden)
       const digest = crypto.createHmac("sha256", secret).update(req.body).digest("hex");
       const a = Buffer.from(digest, "utf8");
       const b = Buffer.from(signature, "utf8");
@@ -39,14 +39,11 @@ app.post(
         return res.status(400).send("Invalid signature");
       }
 
-      // Event yükünü parse et
       const event = JSON.parse(req.body.toString());
       const name  = event?.meta?.event_name || "unknown";
       console.log("✅ LS webhook:", name);
 
-      // TODO: Burada event'e göre DB güncellemesi yapabilirsin.
-      // Örn: subscription_created / subscription_updated / subscription_expired / payment_success
-
+      // TODO: event'e göre DB güncelle (subscription_created/updated/expired/payment_success)
       return res.status(200).send("OK");
     } catch (err) {
       console.error("Webhook error", err);
@@ -55,15 +52,19 @@ app.post(
   }
 );
 
-// Genel istekler için JSON parser (webhook'tan SONRA)
+/** JSON parser — webhook'tan SONRA gelmeli */
 app.use(express.json({ limit: "1mb" }));
 
-// Health & Root
+/** AUTH ROUTES */
+app.post("/auth/signup", auth.signup);
+app.post("/auth/login",  auth.login);
+app.get ("/me",          auth.authMiddleware, auth.me);
+
+/** Health & Root */
 app.get("/health", (req, res) => res.json({ ok: true }));
 app.get("/", (req, res) => res.send("🚀 Revofy backend is running!"));
 
-// --- Kurulum endpoint'i ---
-// Hem GET hem POST kabul etsin; gizli INIT_SECRET ile korunur.
+/** Kurulum endpoint'i (INIT_SECRET ile korunur) */
 app.all("/admin/init", async (req, res) => {
   try {
     const key = (req.query.key || req.headers["x-init-key"]);
@@ -71,7 +72,6 @@ app.all("/admin/init", async (req, res) => {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
-    // Tabloları kuran SQL (çok satırlı template string)
     const sql = `
       -- UUID üretimi için eklenti
       CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -111,7 +111,7 @@ app.all("/admin/init", async (req, res) => {
   }
 });
 
-// Sunucuyu başlat
+/** Server */
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
