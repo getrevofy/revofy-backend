@@ -9,14 +9,16 @@
 // - POST /auth/login
 // - GET  /me                       (JWT ile)
 // - GET  /billing/checkout         (Lemon hosted checkout linki)
+// - POST /chat                     (Auth + limit + OpenAI proxy)
 // ================================
 
 const express = require("express");
 const crypto  = require("crypto");
 const db      = require("./db");
 const auth    = require("./auth");
-const cors   = require("cors");
-const limits = require("./limits");
+const cors    = require("cors");
+const limits  = require("./limits");
+const fetch   = require("node-fetch");
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -45,7 +47,6 @@ app.post(
       // === SUBSCRIPTION DB GÜNCELLE ===
       (async () => {
         const data = event?.data?.attributes || {};
-        // Email birden fazla isimle gelebilir, olası alanları dene:
         const email =
           data.user_email ||
           data.customer_email ||
@@ -58,7 +59,6 @@ app.post(
           return;
         }
 
-        // Kullanıcıyı bul/oluştur
         const { rows: userRows } = await db.query(
           `INSERT INTO users (email)
              VALUES ($1)
@@ -68,7 +68,6 @@ app.post(
         );
         const userId = userRows[0].id;
 
-        // Event adına göre status belirle
         let status = "none";
         if (/subscription_created|subscription_updated|payment_success|order_created/i.test(name)) {
           status = "active";
@@ -77,7 +76,6 @@ app.post(
           status = "expired";
         }
 
-        // Dönem sonu
         const periodEnd = data.renews_at || data.ends_at || data.trial_ends_at || null;
 
         await db.query(
@@ -101,7 +99,8 @@ app.post(
   }
 );
 
-/** JSON parser — webhook’tan SONRA gelmeli */
+/** CORS & JSON parser */
+app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 /** AUTH ROUTES */
@@ -113,17 +112,52 @@ app.get ("/me",          auth.authMiddleware, auth.me);
 app.get("/billing/checkout", auth.authMiddleware, (req, res) => {
   const url = process.env.LEMON_SQUEEZY_CHECKOUT_URL;
   if (!url) return res.status(500).json({ error: "no_checkout_url" });
-  // (opsiyonel) e-posta otomatik dolsun
   const u = new URL(url);
   u.searchParams.set("checkout[email]", req.user.email);
   res.json({ url: u.toString() });
+});
+
+/** CHAT — OpenAI proxy + limit */
+app.post("/chat", auth.authMiddleware, limits.enforceLimit(), async (req, res) => {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "no_openai_key" });
+
+    const messages = req.body?.messages;
+    const model = req.body?.model || "gpt-4o-mini";
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "messages_required" });
+    }
+
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ model, messages, temperature: 0.4 })
+    });
+
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      console.error("OpenAI error:", r.status, t);
+      return res.status(502).json({ error: "openai_failed", status: r.status });
+    }
+
+    const data = await r.json();
+    const text = data?.choices?.[0]?.message?.content || "";
+    res.json({ text, model });
+  } catch (e) {
+    console.error("chat error", e);
+    res.status(500).json({ error: "chat_failed" });
+  }
 });
 
 /** Health & Root */
 app.get("/health", (req, res) => res.json({ ok: true }));
 app.get("/", (req, res) => res.send("🚀 Revofy backend is running!"));
 
-/** Kurulum endpoint'i (INIT_SECRET ile korunur) */
+/** INIT endpoint */
 app.all("/admin/init", async (req, res) => {
   try {
     const key = (req.query.key || req.headers["x-init-key"]);
